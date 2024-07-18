@@ -1,10 +1,12 @@
-from softioc import autosave, builder
+from conftest import get_multiprocessing_context, select_and_recv
+from softioc import autosave, builder, softioc
 from unittest.mock import patch
 import pytest
 import threading
 import numpy
 import re
 import yaml
+import time
 
 DEVICE_NAME = "MY-DEVICE"
 
@@ -166,9 +168,38 @@ def test_stop_event(tmp_path):
         worker.join(timeout=1)
 
 
-def test_load_autosave(existing_autosave_dir):
+def test_backup_on_load(existing_autosave_dir):
+    autosave.configure(existing_autosave_dir, DEVICE_NAME, backup=True)
+    # backup only performed if there are any pvs to save
+    builder.aOut("SAVED-AO", autosave=True)
+    autosave.load_autosave()
+    backup_files = list(existing_autosave_dir.glob("*.softsav_*"))
+    assert len(backup_files) == 1
+    # assert backup file is named <name>.softsave_yymmdd-HHMMSS
+    for file in backup_files:
+        assert re.match(
+            r"^" + DEVICE_NAME + r"\.softsav_[0-9]{6}-[0-9]{6}$", file.name
+        )
+
+
+def test_autosave_key_names(tmp_path):
+    builder.aOut("DEFAULTNAME", autosave=True)
     builder.SetDeviceName(DEVICE_NAME)
-    autosave.configure(existing_autosave_dir, DEVICE_NAME, backup=False)
+    builder.aOut("DEFAULTNAMEAFTERPREFIXSET", autosave=True)
+    builder.aOut("RENAMEME", autosave=True, autosave_name="CUSTOMNAME")
+    autosave.configure(tmp_path, DEVICE_NAME)
+    autosaver = autosave.Autosave()
+    autosaver._save()
+    with open(tmp_path / f"{DEVICE_NAME}.softsav", "r") as f:
+        saved = yaml.full_load(f)
+    assert "DEFAULTNAME" in saved
+    assert "DEFAULTNAMEAFTERPREFIXSET" in saved
+    assert "CUSTOMNAME" in saved
+
+
+def check_all_record_types_load_properly(device_name, autosave_dir, conn):
+    builder.SetDeviceName(device_name)
+    autosave.configure(autosave_dir, device_name, backup=False)
     pv_aOut = builder.aOut("SAVED-AO", autosave=True)
     pv_aIn = builder.aIn("SAVED-AI", autosave=True)
     pv_boolOut = builder.boolOut("SAVED-BO", autosave=True)
@@ -209,7 +240,8 @@ def test_load_autosave(existing_autosave_dir):
     assert pv_Action.get() == 0
     assert (pv_WaveformIn.get() == numpy.array([0, 0, 0, 0])).all()
     assert (pv_WaveformOut.get() == numpy.array([0, 0, 0, 0])).all()
-    autosave.load_autosave()
+    # load called automatically when LoadDatabase() called
+    builder.LoadDatabase()
     assert pv_aOut.get() == 20.0
     assert pv_aIn.get() == 20.0
     assert pv_boolOut.get() == 1
@@ -227,32 +259,80 @@ def test_load_autosave(existing_autosave_dir):
     assert pv_Action.get() == 1
     assert (pv_WaveformIn.get() == numpy.array([1, 2, 3, 4])).all()
     assert (pv_WaveformOut.get() == numpy.array([1, 2, 3, 4])).all()
+    conn.send("D")  # "Done"
 
 
-def test_backup_on_load(existing_autosave_dir):
-    autosave.configure(existing_autosave_dir, DEVICE_NAME, backup=True)
-    # backup only performed if there are any pvs to save
-    builder.aOut("SAVED-AO", autosave=True)
-    autosave.load_autosave()
-    backup_files = list(existing_autosave_dir.glob("*.softsav_*"))
-    assert len(backup_files) == 1
-    # assert backup file is named <name>.softsave_yymmdd-HHMMSS
-    for file in backup_files:
-        assert re.match(
-            r"^" + DEVICE_NAME + r"\.softsav_[0-9]{6}-[0-9]{6}$", file.name
-        )
+def test_actual_ioc_load(existing_autosave_dir):
+    ctx = get_multiprocessing_context()
+    parent_conn, child_conn = ctx.Pipe()
+    ioc_process = ctx.Process(
+        target=check_all_record_types_load_properly,
+        args=(DEVICE_NAME, existing_autosave_dir, child_conn),
+    )
+    ioc_process.start()
+    # If we never receive D it probably means an assert failed
+    select_and_recv(parent_conn, "D")
 
 
-def test_autosave_key_names(tmp_path):
-    builder.aOut("DEFAULTNAME", autosave=True)
-    builder.SetDeviceName(DEVICE_NAME)
-    builder.aOut("DEFAULTNAMEAFTERPREFIXSET", autosave=True)
-    builder.aOut("RENAMEME", autosave=True, autosave_name="CUSTOMNAME")
-    autosave.configure(tmp_path, DEVICE_NAME)
-    autosaver = autosave.Autosave()
-    autosaver._save()
-    with open(tmp_path / f"{DEVICE_NAME}.softsav", "r") as f:
+def check_all_record_types_save_properly(device_name, autosave_dir, conn):
+    builder.SetDeviceName(device_name)
+    autosave.configure(autosave_dir, device_name, save_period=1)
+    builder.aOut("aOut", autosave=True, initial_value=20.0)
+    builder.aIn("aIn", autosave=True, initial_value=20.0)
+    builder.boolOut("boolOut", autosave=True, initial_value=1)
+    builder.boolIn("boolIn", autosave=True, initial_value=1)
+    builder.longIn("longIn", autosave=True, initial_value=20)
+    builder.longOut("longOut", autosave=True, initial_value=20)
+    builder.int64In("int64In", autosave=True, initial_value=100)
+    builder.int64Out("int64Out", autosave=True, initial_value=100)
+    builder.mbbIn("mbbIn", autosave=True, initial_value=15)
+    builder.mbbOut("mbbOut", autosave=True, initial_value=15)
+    builder.stringIn("stringIn", autosave=True, initial_value="test string in")
+    builder.stringOut(
+        "stringOut", autosave=True, initial_value="test string out"
+    )
+    builder.longStringIn(
+        "longStringIn", autosave=True, initial_value="test long string in"
+    )
+    builder.longStringOut(
+        "longStringOut", autosave=True, initial_value="test long string out"
+    )
+    builder.Action("Action", autosave=True, initial_value=1)
+    builder.WaveformIn("WaveformIn", [1, 2, 3, 4], autosave=True)
+    builder.WaveformOut("WaveformOut", [1, 2, 3, 4], autosave=True)
+    builder.LoadDatabase()
+    softioc.iocInit()
+    # wait long enough to ensure one save has occurred
+    time.sleep(2)
+    with open(autosave_dir / f"{device_name}.softsav", "r") as f:
         saved = yaml.full_load(f)
-    assert "DEFAULTNAME" in saved
-    assert "DEFAULTNAMEAFTERPREFIXSET" in saved
-    assert "CUSTOMNAME" in saved
+    assert saved["aOut"] == 20.0
+    assert saved["aIn"] == 20.0
+    assert saved["boolOut"] == 1
+    assert saved["boolIn"] == 1
+    assert saved["longIn"] == 20
+    assert saved["longOut"] == 20
+    assert saved["int64In"] == 100
+    assert saved["int64Out"] == 100
+    assert saved["mbbIn"] == 15
+    assert saved["mbbOut"] == 15
+    assert saved["stringIn"] == "test string in"
+    assert saved["stringOut"] == "test string out"
+    assert saved["longStringIn"] == "test long string in"
+    assert saved["longStringOut"] == "test long string out"
+    assert saved["Action"] == 1
+    assert (saved["WaveformIn"] == numpy.array([1, 2, 3, 4])).all()
+    assert (saved["WaveformOut"] == numpy.array([1, 2, 3, 4])).all()
+    conn.send("D")
+
+
+def test_actual_ioc_save(tmp_path):
+    ctx = get_multiprocessing_context()
+    parent_conn, child_conn = ctx.Pipe()
+    ioc_process = ctx.Process(
+        target=check_all_record_types_save_properly,
+        args=(DEVICE_NAME, tmp_path, child_conn),
+    )
+    ioc_process.start()
+    # If we never receive D it probably means an assert failed
+    select_and_recv(parent_conn, "D")
