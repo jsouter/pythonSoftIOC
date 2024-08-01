@@ -1,18 +1,20 @@
 import atexit
+import numpy
 import sys
 import threading
 import traceback
+import time
+import yaml
+
 from datetime import datetime
 from os import rename
 from pathlib import Path
 from shutil import copy2
 
-import numpy
-import yaml
-
 SAV_SUFFIX = "softsav"
 SAVB_SUFFIX = "softsavB"
 DEFAULT_SAVE_PERIOD = 30.0
+DEFAULT_FILENAME = "auto"
 
 
 def _ndarray_representer(dumper, array):
@@ -20,34 +22,26 @@ def _ndarray_representer(dumper, array):
         "tag:yaml.org,2002:seq", array.tolist(), flow_style=True
     )
 
+def configure_directory(directory, enabled=True):
+    __Autosave.directory = Path(directory)
+    __Autosave.enabled = enabled
 
-def configure(
-    directory, name, save_period=DEFAULT_SAVE_PERIOD, backup=True, enabled=True
-):
-    """This should be called before initialising the IOC. Configures the
-    autosave thread for periodic backing up of PV values.
+def configure_file(filename=DEFAULT_FILENAME, save_period=30, timestamped_backups=True, enabled=True):
+    __Autosave.files[filename] = __AutosaveFile(filename, save_period, timestamped_backups, enabled)
 
-    Args:
-        directory: string or Path giving directory path where autosave backup
-            files are saved and loaded.
-        name: string name of the root used for naming backup files, this
-            is usually the same as the device prefix.
-        save_period: time in seconds between backups. Backups are only performed
-            if PV values have changed.
-        backup: creates a backup of the loaded autosave file on load,
-            timestamped with the time of backup.
-        enabled: boolean which enables or disables autosave, set to True by
-            default, or False if configure not called.
-    """
-    Autosave.directory = Path(directory)
-    Autosave.backup_on_load = backup
-    Autosave.save_period = save_period
-    Autosave.enabled = enabled
-    Autosave.device_name = name
+class __AutosaveFile:
+    def __init__(self, filename, save_period, timestamped_backups, enabled):
+        self.filename = filename
+        self.save_period = save_period
+        self.timestamped_backups = timestamped_backups
+        self.enabled = enabled
+        self.last_saved_time = datetime.now()
+        self.pvs = {}
+        self.last_state = {}
 
 
 def start_autosave_thread():
-    autosaver = Autosave()
+    autosaver = __Autosave()
     worker = threading.Thread(
         target=autosaver.loop,
     )
@@ -61,7 +55,7 @@ def _shutdown_autosave_thread(autosaver, worker):
     worker.join()
 
 
-def add_pv_to_autosave(pv, name, save_val, save_fields):
+def add_pv_to_autosave(pv, name, save_val, save_fields, filename):
     """Configures a PV for autosave
 
     Args:
@@ -74,14 +68,19 @@ def add_pv_to_autosave(pv, name, save_val, save_fields):
         save_fields: a list of string names of fields associated with the pv
             to be saved to and loaded from a backup
     """
+    if not filename:
+        filename = DEFAULT_FILENAME
+    if filename not in __Autosave.files:
+        raise Exception("Some kind of error here TODO")
+    file = __Autosave.files[filename]
     if save_val:
-        Autosave._pvs[name] = _AutosavePV(pv)
+        file.pvs[name] = _AutosavePV(pv)
     for field in save_fields:
-        Autosave._pvs[f"{name}.{field}"] = _AutosavePV(pv, field)
+        file.pvs[name] = __AutosaveFile(pv, field)
 
 
 def load_autosave():
-    Autosave._load()
+    __Autosave._load()
 
 
 class _AutosavePV:
@@ -94,16 +93,14 @@ class _AutosavePV:
             self.set = lambda val: setattr(pv, field, val)
 
 
-class Autosave:
+class __Autosave:
     _pvs = {}
-    _last_saved_state = {}
     _last_saved_time = datetime.now()
     _stop_event = threading.Event()
     save_period = DEFAULT_SAVE_PERIOD
-    device_name = None
     directory = None
     enabled = False
-    backup_on_load = False
+    files = {}
 
     def __init__(self):
         if not self.enabled:
@@ -111,11 +108,6 @@ class Autosave:
         yaml.add_representer(
             numpy.ndarray, _ndarray_representer, Dumper=yaml.Dumper
         )
-        if not self.device_name:
-            raise RuntimeError(
-                "Device name is not known to autosave thread, "
-                "call autosave.configure() with keyword argument name"
-            )
         if not self.directory:
             raise RuntimeError(
                 "Autosave directory is not known, call "
@@ -126,56 +118,41 @@ class Autosave:
             raise FileNotFoundError(
                 f"{self.directory} is not a valid autosave directory"
             )
-        self._last_saved_time = datetime.now()
+    
+    @classmethod
+    def _get_sav_file(cls, file):
+        return cls.directory / f"{file.filename}.{SAV_SUFFIX}"
 
     @classmethod
-    def _backup_sav_file(cls):
-        if not cls.directory and cls.directory.is_dir():
-            print(
-                f"Could not back up autosave as {cls.directory} is"
-                " not a valid directory",
-                file=sys.stderr,
-            )
-            return
-        sav_path = cls._get_current_sav_path()
-        if sav_path.is_file():
-            copy2(sav_path, cls._get_timestamped_backup_sav_path())
-        else:
-            print(
-                f"Could not back up autosave, {sav_path} is not a file",
-                file=sys.stderr,
-            )
+    def _get_tmp_file(cls, file):
+        return cls.directory / f"{file.filename}.{SAVB_SUFFIX}"
 
     @classmethod
-    def _get_timestamped_backup_sav_path(cls):
-        sav_path = cls._get_current_sav_path()
-        return sav_path.parent / (
-            sav_path.name + cls._last_saved_time.strftime("_%y%m%d-%H%M%S")
-        )
+    def _load(cls):
+        for file in [f for f in cls.files.values() if f.enabled]:
+            sav_path = cls._get_sav_file(file)
+            if not sav_path.is_file():
+                print(sav_path, "not a file")
+                continue
+            if file.timestamped_backups:
+                bu_file = sav_path.parent / f"{sav_path.name}{file.last_saved_time.strftime('_%y%m%d-%H%M%S')}"
+            else:
+                bu_file = cls.directory / f"{file.filename}.bu" 
+            copy2(sav_path, bu_file)
 
-    @classmethod
-    def _get_backup_sav_path(cls):
-        return cls.directory / f"{cls.device_name}.{SAVB_SUFFIX}"
-
-    @classmethod
-    def _get_current_sav_path(cls):
-        return cls.directory / f"{cls.device_name}.{SAV_SUFFIX}"
-
-    def _get_state(self):
-        state = {}
-        for pv_field, pv in self._pvs.items():
             try:
-                state[pv_field] = pv.get()
+                with open(sav_path, "r") as f:
+                    state = yaml.full_load(f)
+                    cls._set_pvs_from_state(file, state)
+
             except Exception:
-                print(f"Exception getting {pv_field}", file=sys.stderr)
                 traceback.print_exc()
-        return state
-
+    
     @classmethod
-    def _set_pvs_from_saved_state(cls):
-        for pv_field, value in cls._last_saved_state.items():
+    def _set_pvs_from_state(cls, file, state):
+        for pv_field, value in state.items():
             try:
-                pv = cls._pvs[pv_field]
+                pv = file.pvs[pv_field]
                 pv.set(value)
             except Exception:
                 print(
@@ -184,57 +161,59 @@ class Autosave:
                 )
                 traceback.print_exc()
 
-    def _state_changed(self, state):
-        return self._last_saved_state.keys() != state.keys() or any(
-            # checks equality for builtins and numpy arrays
-            not numpy.array_equal(state[key], self._last_saved_state[key])
+    def _get_state(self, file):
+        state = {}
+        for pv_field, pv in file.pvs.items():
+            try:
+                state[pv_field] = pv.get()
+            except Exception:
+                print(f"Exception getting {pv_field}", file=sys.stderr)
+                traceback.print_exc()
+        return state
+
+    def _state_changed(self, state, file):
+        return state.keys() != file.last_state.keys() or any(
+            not numpy.array_equal(state[key], file.last_state[key])
             for key in state
         )
+        # checks equality for builtins and numpy arrays
 
-    def _save(self):
-        state = self._get_state()
-        if self._state_changed(state):
-            sav_path = self._get_current_sav_path()
-            backup_path = self._get_backup_sav_path()
-            # write to backup file first then use atomic os.rename
-            # to safely update stored state
-            with open(backup_path, "w") as backup:
-                yaml.dump(state, backup, indent=4)
-            rename(backup_path, sav_path)
-            self._last_saved_state = state
-            self._last_saved_time = datetime.now()
-
-    @classmethod
-    def _load(cls, path=None):
-        if not cls.enabled or not cls._pvs:
+    def _save(self, file, now, force=False):
+        print(file, now)
+        if (now - file.last_saved_time).seconds < file.save_period and not force:
             return
-        if cls.backup_on_load:
-            cls._backup_sav_file()
-        sav_path = path or cls._get_current_sav_path()
-        if not sav_path or not sav_path.is_file():
-            print(
-                f"Could not load autosave values from file {sav_path}",
-                file=sys.stderr,
-            )
+        state = self._get_state(file)
+        if not self._state_changed(state, file):
             return
-        with open(sav_path, "r") as f:
-            cls._last_saved_state = yaml.full_load(f)
-        cls._set_pvs_from_saved_state()
+        # else do the saving
+        # TODO: __AutosaveFile needs to hold a last_saved_state dict.
+        sav_path = self._get_sav_file(file)
+        tmp_path = self._get_tmp_file(file)
+        with open(tmp_path, "w") as tmp:
+            yaml.dump(state, tmp, indent=4)
+        rename(tmp_path, sav_path)
+        file.last_state = state
+        file.last_saved_time = now  # or should we call datetime.now() again?
 
-    def stop(self):
-        self._stop_event.set()
+    def _save_all(self, now):
+        for file in self.files.values():
+            self._save(file, now, force=True)
 
-    def loop(self):
-        if not self.enabled or not self._pvs:
+    def loop(self):  # should we check if asyncio is available and if so, use it?? it would be better probably that calling time
+        # over and over...
+        if not self.enabled or not self.files:
             return
         while True:
+            now = datetime.now()  # is there a better way to do this???
             try:
-                self._stop_event.wait(timeout=self.save_period)
-                self._save()
-                if self._stop_event.is_set():  # Stop requested
-                    return
+                for file in self.files.values():
+                    if self._stop_event.is_set():
+                        # stop requested, save every file then exit
+                        self._save_all(now)
+                    else:
+                        self._save(file, now)
             except Exception:
                 traceback.print_exc()
 
-
-__all__ = ["configure"]
+    def stop(self):
+        self._stop_event.set()

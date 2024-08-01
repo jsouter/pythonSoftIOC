@@ -58,9 +58,10 @@ class ProcessDeviceSupportCore(DeviceSupportCore, RecordLookup):
         autosave_enabled = kargs.pop("autosave", False)
         autosave_fields = kargs.pop("autosave_fields", [])
         autosave_name = kargs.pop("autosave_name", name)
+        autosave_file = kargs.pop("autosave_file", None)
         if autosave_enabled or autosave_fields:
             add_pv_to_autosave(
-                self, autosave_name, autosave_enabled, autosave_fields)
+                self, autosave_name, autosave_enabled, autosave_fields, autosave_file)
         self.__super.__init__(name, **kargs)
 
     # Most subclasses (all except waveforms) define a ctypes constructor for the
