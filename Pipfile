@@ -8,6 +8,7 @@ softioc = {editable = true, extras = ["dev"], path = "."}
 
 [packages]
 softioc = {editable = true, extras = ["useful"], path = "."}
+setuptools-dso = "==2.9"
 
 [scripts]
 # Do flake8 here so it doesn't happen in the container in CI
